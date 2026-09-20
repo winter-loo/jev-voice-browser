@@ -50,34 +50,53 @@ export function cleanForMatch(s) {
 }
 
 /**
- * Strips previously executed prefix from transcript `clean`.
- * Handles Chinese punctuation variations (。vs ，), spaces, and case differences.
- * Returns the unexecuted remainder of `clean`, or null if the prefix did not match.
+ * Extracts newly appeared unexecuted text from raw cumulative transcript `rawText`,
+ * stripping off `baselineText` (all text executed previously).
+ * Handles punctuation revisions (。vs ，), spaces, and resets when recognizer buffer was cleared.
+ */
+export function extractNewText(rawText, baselineText) {
+  if (!rawText) return "";
+  if (!baselineText) return rawText.trim();
+  const normBase = cleanForMatch(baselineText);
+  const normRaw = cleanForMatch(rawText);
+  if (!normBase) return rawText.trim();
+
+  if (normRaw.startsWith(normBase)) {
+    let baseIdx = 0;
+    let rawIdx = 0;
+    while (rawIdx < rawText.length && baseIdx < normBase.length) {
+      const ch = rawText[rawIdx].toLowerCase();
+      if (/[\s\p{P}\p{S}]/u.test(ch)) {
+        rawIdx++;
+        continue;
+      }
+      if (ch === normBase[baseIdx]) {
+        baseIdx++;
+        rawIdx++;
+      } else {
+        break;
+      }
+    }
+    if (baseIdx === normBase.length) {
+      return rawText.slice(rawIdx).replace(/^[\s\p{P}\p{S}]+/u, "").trim();
+    }
+  }
+
+  // If rawText is shorter and matches the beginning of baseline, it is a partial re-emit of the baseline
+  if (normBase.startsWith(normRaw)) {
+    return "";
+  }
+
+  // If recognizer buffer cleared or completely new text started, return rawText directly
+  return rawText.trim();
+}
+
+/**
+ * Backward-compatible alias for stripExecutedPrefix
  */
 export function stripExecutedPrefix(clean, consumedPrefix) {
-  const normPrefix = cleanForMatch(consumedPrefix);
-  if (!normPrefix) return clean;
-
-  let prefixIdx = 0;
-  let cleanIdx = 0;
-  while (cleanIdx < clean.length && prefixIdx < normPrefix.length) {
-    const ch = clean[cleanIdx].toLowerCase();
-    if (/[\s\p{P}\p{S}]/u.test(ch)) {
-      cleanIdx++;
-      continue;
-    }
-    if (ch === normPrefix[prefixIdx]) {
-      prefixIdx++;
-      cleanIdx++;
-    } else {
-      break;
-    }
-  }
-
-  if (prefixIdx === normPrefix.length) {
-    return clean.slice(cleanIdx).replace(/^[\s\p{P}\p{S}]+/u, "");
-  }
-  return null;
+  const res = extractNewText(clean, consumedPrefix);
+  return res || null;
 }
 
 function stripFiller(s) {

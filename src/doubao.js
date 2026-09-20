@@ -161,7 +161,7 @@ export class DoubaoBridgeClient extends EventEmitter {
     const utteranceId = this.activeSessionId ? `doubao-s${this.activeSessionId}` : `doubao-live`;
 
     if (type === "partial" || type === "text") {
-      if (msg.text) {
+      if (msg.text != null) {
         this.emit("transcript", {
           text: msg.text,
           final: false,
@@ -196,6 +196,10 @@ export class DoubaoBridgeClient extends EventEmitter {
 
   stopSession() {
     return this.send("stop");
+  }
+
+  clear() {
+    return this.send("clear");
   }
 
   close() {

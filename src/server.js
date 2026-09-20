@@ -109,6 +109,9 @@ export async function startServer(opts = {}) {
   controller.on("candidates", (p) => broadcast("candidates", p));
   controller.on("pending", (p) => broadcast("pending", p));
   controller.on("tabs", (p) => broadcast("tabs", p));
+  controller.on("action_consumed", () => {
+    doubao.clear();
+  });
 
   // Forward Doubao voice events
   doubao.on("connected", (info) => {

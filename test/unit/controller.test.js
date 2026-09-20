@@ -201,29 +201,42 @@ test("typed command is treated as a final utterance", async () => {
 test("continuous Chinese commands: multiple commands with punctuation are executed sequentially", async () => {
   const { c, executed } = setup();
   await c.start();
+
+  const transcripts = [];
+  c.on("transcript", (t) => transcripts.push(t.text));
+  const consumedEvents = [];
+  c.on("action_consumed", (e) => consumedEvents.push(e));
+
   // Command 1
   c.handleTranscript({ text: "往下滑一页。", final: false, utteranceId: "live1" });
   await sleep(DEBOUNCE_MS + 150);
   assert.equal(executed.length, 1);
   assert.equal(executed[0].type, "scroll_down");
 
-  // Command 2 (notice comma punctuation revision and no space)
+  // Command 2 (notice comma punctuation revision and no space; should only emit fresh command)
   c.handleTranscript({ text: "往下滑一页，点击链接。", final: false, utteranceId: "live1" });
   await sleep(DEBOUNCE_MS + 150);
   assert.equal(executed.length, 2);
   assert.equal(executed[1].type, "click_element");
+  assert.ok(transcripts.includes("点击链接。"));
+  assert.ok(!transcripts.includes("往下滑一页，点击链接。"));
 
-  // Command 3 (3rd command in continuous stream)
+  // Command 3 (3rd command in continuous stream; should only emit fresh command)
   c.handleTranscript({ text: "往下滑一页。点击链接。打开YouTube。", final: false, utteranceId: "live1" });
   await sleep(DEBOUNCE_MS + 150);
   assert.equal(executed.length, 3);
   assert.equal(executed[2].type, "navigate_url");
+  assert.ok(transcripts.includes("打开YouTube。"));
+  assert.ok(!transcripts.includes("往下滑一页。点击链接。打开YouTube。"));
 
   // Command 4 (4th command in continuous stream, repeating same phrase)
   c.handleTranscript({ text: "往下滑一页。点击链接。打开YouTube。打开YouTube。", final: false, utteranceId: "live1" });
   await sleep(DEBOUNCE_MS + 150);
   assert.equal(executed.length, 4);
   assert.equal(executed[3].type, "navigate_url");
+
+  // Verify action_consumed fired for each command
+  assert.equal(consumedEvents.length, 4);
 
   await c.close();
 });

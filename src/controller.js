@@ -7,7 +7,7 @@ import { DEBOUNCE_MS, SILENCE_COMPLETE_MS, CANDIDATE_TTL_MS, MAX_INFLIGHT, MODEL
 import { decide, isAbortError } from "./jev.js";
 import { evaluatePolicy, describe } from "./policy.js";
 import { execute } from "./executor.js";
-import { parseCandidatePick, cleanTranscript, cleanForMatch, stripExecutedPrefix } from "./spans.js";
+import { parseCandidatePick, cleanTranscript, cleanForMatch, stripExecutedPrefix, extractNewText } from "./spans.js";
 import { approxTokens } from "./snapshot.js";
 
 const avg = (xs) => (xs.length ? Math.round(xs.reduce((a, b) => a + b, 0) / xs.length) : null);
@@ -26,6 +26,8 @@ export class Controller extends EventEmitter {
     this.snapshotAt = 0;
     this.utterance = null; // { id, physicalId, prefix, gen, text, final, startedAt, updatedAt, actedOn, actedText }
     this.consumed = null; // { id: physical utterance id, prefix: executed text (lowercase), gen }
+    this.lastRawText = "";
+    this.baselineRaw = "";
     this.pending = null; // destructive action awaiting "confirm"
     this.candidates = null; // { list: [{n,id,label}], intent: {type,text}, at }
     this.lastDecision = null;
@@ -68,8 +70,18 @@ export class Controller extends EventEmitter {
    * @param {{text: string, final?: boolean, utteranceId: string|number}} msg
    */
   handleTranscript({ text, final = false, utteranceId }) {
+    this.lastRawText = String(text || "");
     let clean = cleanTranscript(text);
     const now = Date.now();
+
+    if (!clean) {
+      if (final) {
+        this.consumed = null;
+        this.baselineRaw = "";
+      }
+      this.emit("transcript", { text: "", final, utteranceId, actedOn: false });
+      return;
+    }
 
     // One action per utterance — but if the user keeps talking in the same breath
     // ("go to wikipedia ... search for alan turing") or continues speaking in a continuous
@@ -78,8 +90,8 @@ export class Controller extends EventEmitter {
     const consumed = this.consumed;
     let virtualId = utteranceId;
     if (consumed && consumed.id === utteranceId) {
-      const stripped = stripExecutedPrefix(clean, consumed.prefix);
-      if (stripped !== null) {
+      const stripped = extractNewText(clean, consumed.prefix);
+      if (stripped) {
         clean = stripped;
         const words = clean.split(/\s+/).filter(Boolean);
         const hasCJK = /[\u4e00-\u9fa5]/.test(clean);
@@ -145,11 +157,14 @@ export class Controller extends EventEmitter {
     utt.actedText = text;
     const hasCJK = /[\u4e00-\u9fa5]/.test(utt.prefix) || /[\u4e00-\u9fa5]/.test(text);
     const glue = hasCJK || !utt.prefix ? "" : " ";
+    const combined = this.lastRawText || `${utt.prefix}${glue}${text}`.trim().toLowerCase();
     this.consumed = {
       id: utt.physicalId,
-      prefix: `${utt.prefix}${glue}${text}`.trim().toLowerCase(),
+      prefix: combined,
       gen: (utt.gen || 0) + 1,
     };
+    this.baselineRaw = combined;
+    this.emit("action_consumed", { text, rawText: combined });
   }
 
   /** Ask Jev about the current utterance. Cancels any in-flight request. */

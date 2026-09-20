@@ -24,8 +24,9 @@
   .card h2{font-size:11px;text-transform:uppercase;letter-spacing:.12em;color:var(--muted);margin:0 0 8px;font-weight:600;display:flex;align-items:center;gap:8px}
   .card h2 .r{margin-left:auto;font-weight:400;text-transform:none;letter-spacing:0}
   .grow{flex:1;overflow:auto}
-  #transcript{font-size:26px;font-weight:600;min-height:72px;line-height:1.25;word-break:break-word}
+  #transcript{font-size:26px;font-weight:600;min-height:72px;line-height:1.25;word-break:break-word;transition:color .2s,opacity .3s}
   #transcript.acted{color:var(--green)}
+  #transcript.fading{opacity:0.35}
   #transcript .interim{color:var(--muted);font-weight:400}
   .row{display:flex;gap:8px;align-items:center;flex-wrap:wrap}
   button{background:var(--panel2);color:var(--text);border:1px solid var(--line);border-radius:8px;padding:8px 12px;font-weight:600;cursor:pointer}
@@ -186,7 +187,25 @@
         case "hello": ui = payload; renderAll(); break;
         case "transcript": renderTranscript(payload); break;
         case "decision": renderDecision(payload); break;
-        case "action": ui = payload.ui; renderStats(); renderSnapshot(); break;
+        case "action":
+          ui = payload.ui;
+          renderStats();
+          renderSnapshot();
+          const tEl = $("transcript");
+          tEl.className = "acted";
+          clearTimeout(transcriptFadeTimer);
+          transcriptFadeTimer = setTimeout(() => {
+            if (tEl.className === "acted") {
+              tEl.classList.add("fading");
+              setTimeout(() => {
+                if (tEl.classList.contains("fading")) {
+                  tEl.className = "";
+                  tEl.innerHTML = '<span class="interim">Listening…</span>';
+                }
+              }, 300);
+            }
+          }, 1200);
+          break;
         case "snapshot": ui && (ui.snapshot = payload); renderSnapshot(); break;
         case "log": appendLog(payload); break;
         case "candidates": candIds = new Set((payload || []).map((c) => c.id)); renderSnapshot(); break;
@@ -231,8 +250,16 @@
     $("elements").innerHTML = rows.join("");
     const hot = $("elements").querySelector(".hot"); if (hot) hot.scrollIntoView({ block: "center" });
   }
+  let transcriptFadeTimer = null;
   function renderTranscript(p) {
+    clearTimeout(transcriptFadeTimer);
     const el = $("transcript");
+    el.classList.remove("fading");
+    if (!p.text || !p.text.trim()) {
+      el.className = "";
+      el.innerHTML = '<span class="interim">Listening…</span>';
+      return;
+    }
     el.className = p.actedOn ? "acted" : "";
     el.innerHTML = p.final ? esc(p.text) : `${esc(p.text)} <span class="interim">…</span>`;
   }
