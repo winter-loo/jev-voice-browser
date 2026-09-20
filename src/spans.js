@@ -42,6 +42,44 @@ export function cleanTranscript(text) {
     .trim();
 }
 
+/** Strip punctuation and whitespace to normalize text for prefix/command comparison */
+export function cleanForMatch(s) {
+  return String(s || "")
+    .toLowerCase()
+    .replace(/[\s\p{P}\p{S}]+/gu, "");
+}
+
+/**
+ * Strips previously executed prefix from transcript `clean`.
+ * Handles Chinese punctuation variations (。vs ，), spaces, and case differences.
+ * Returns the unexecuted remainder of `clean`, or null if the prefix did not match.
+ */
+export function stripExecutedPrefix(clean, consumedPrefix) {
+  const normPrefix = cleanForMatch(consumedPrefix);
+  if (!normPrefix) return clean;
+
+  let prefixIdx = 0;
+  let cleanIdx = 0;
+  while (cleanIdx < clean.length && prefixIdx < normPrefix.length) {
+    const ch = clean[cleanIdx].toLowerCase();
+    if (/[\s\p{P}\p{S}]/u.test(ch)) {
+      cleanIdx++;
+      continue;
+    }
+    if (ch === normPrefix[prefixIdx]) {
+      prefixIdx++;
+      cleanIdx++;
+    } else {
+      break;
+    }
+  }
+
+  if (prefixIdx === normPrefix.length) {
+    return clean.slice(cleanIdx).replace(/^[\s\p{P}\p{S}]+/u, "");
+  }
+  return null;
+}
+
 function stripFiller(s) {
   return s.replace(FILLER_RE, " ").replace(/\s+/g, " ").replace(/[.,!?]+$/g, "").trim();
 }

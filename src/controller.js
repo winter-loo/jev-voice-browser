@@ -7,7 +7,7 @@ import { DEBOUNCE_MS, SILENCE_COMPLETE_MS, CANDIDATE_TTL_MS, MAX_INFLIGHT, MODEL
 import { decide, isAbortError } from "./jev.js";
 import { evaluatePolicy, describe } from "./policy.js";
 import { execute } from "./executor.js";
-import { parseCandidatePick, cleanTranscript } from "./spans.js";
+import { parseCandidatePick, cleanTranscript, cleanForMatch, stripExecutedPrefix } from "./spans.js";
 import { approxTokens } from "./snapshot.js";
 
 const avg = (xs) => (xs.length ? Math.round(xs.reduce((a, b) => a + b, 0) / xs.length) : null);
@@ -72,18 +72,29 @@ export class Controller extends EventEmitter {
     const now = Date.now();
 
     // One action per utterance — but if the user keeps talking in the same breath
-    // ("go to wikipedia ... search for alan turing"), the words after the already-executed
-    // command become a fresh virtual utterance (id "<physical>+<n>"). Fewer than two new words
-    // ("please") are ignored.
+    // ("go to wikipedia ... search for alan turing") or continues speaking in a continuous
+    // voice session, the words after already-executed commands become a fresh virtual utterance
+    // (id "<physical>+<n>").
     const consumed = this.consumed;
     let virtualId = utteranceId;
     if (consumed && consumed.id === utteranceId) {
-      if (!clean.toLowerCase().startsWith(consumed.prefix)) return; // recognizer revised the executed words; ignore
-      clean = clean.slice(consumed.prefix.length).trim();
-      const words = clean.split(/\s+/).filter(Boolean);
-      const hasCJK = /[\u4e00-\u9fa5]/.test(clean);
-      if (hasCJK ? clean.length < 2 : words.length < 2) return;
-      virtualId = `${utteranceId}+${consumed.gen}`;
+      const stripped = stripExecutedPrefix(clean, consumed.prefix);
+      if (stripped !== null) {
+        clean = stripped;
+        const words = clean.split(/\s+/).filter(Boolean);
+        const hasCJK = /[\u4e00-\u9fa5]/.test(clean);
+        if (hasCJK ? clean.length < 2 : words.length < 2) return;
+        virtualId = `${utteranceId}+${consumed.gen}`;
+      } else {
+        const normClean = cleanForMatch(clean);
+        const normPrefix = cleanForMatch(consumed.prefix);
+        if (normPrefix.startsWith(normClean)) {
+          // recognizer is still producing a partial of the executed text; wait
+          return;
+        }
+        // recognizer reset or started a completely new utterance; clear consumed so we don't drop it
+        this.consumed = null;
+      }
     }
 
     if (!this.utterance || this.utterance.id !== virtualId) {
@@ -132,9 +143,11 @@ export class Controller extends EventEmitter {
   _consume(utt, text) {
     utt.actedOn = true;
     utt.actedText = text;
+    const hasCJK = /[\u4e00-\u9fa5]/.test(utt.prefix) || /[\u4e00-\u9fa5]/.test(text);
+    const glue = hasCJK || !utt.prefix ? "" : " ";
     this.consumed = {
       id: utt.physicalId,
-      prefix: `${utt.prefix} ${text}`.trim().toLowerCase(),
+      prefix: `${utt.prefix}${glue}${text}`.trim().toLowerCase(),
       gen: (utt.gen || 0) + 1,
     };
   }
