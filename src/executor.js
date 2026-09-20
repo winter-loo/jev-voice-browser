@@ -1,15 +1,12 @@
 /**
- * Execute a policy action on the controlled browser with Playwright.
+ * Execute a policy action on the controlled browser via native CDP / DOM manipulation.
+ * Completely removes Playwright dependency.
  * Shows overlay feedback (highlight + toast) on the page.
  */
 import { HIGHLIGHT_MS } from "./constants.js";
 import { describe } from "./policy.js";
 
 const NAV_TIMEOUT = 15000;
-
-function locatorFor(page, id) {
-  return page.locator(`[data-vb-id="${id}"]`).first();
-}
 
 async function settle(page, ms = 2500) {
   await Promise.race([page.waitForLoadState("domcontentloaded").catch(() => {}), new Promise((r) => setTimeout(r, ms))]);
@@ -19,6 +16,7 @@ async function settle(page, ms = 2500) {
 /** Wait for a possible new tab after a click (target=_blank). */
 async function maybeNewTab(browser, before) {
   await new Promise((r) => setTimeout(r, 400));
+  await browser.refreshTabs().catch(() => {});
   const fresh = browser.pages.find((p) => !before.includes(p));
   if (fresh) await browser.setActive(fresh);
 }
@@ -39,14 +37,13 @@ export async function execute(action, browser) {
       try {
         await page.goto(action.url, { waitUntil: "domcontentloaded", timeout: NAV_TIMEOUT });
       } catch (e) {
-        // Transient network error or a site that never fires load: retry once, then accept if the
-        // URL at least moved to the right host.
         await new Promise((r) => setTimeout(r, 500));
         await page.goto(action.url, { waitUntil: "commit", timeout: NAV_TIMEOUT }).catch(() => {});
-        if (!page.url().includes(host)) throw e;
+        const current = await page.url();
+        if (!current.includes(host)) throw e;
       }
       await settle(page, 800);
-      return { ok: true, detail: page.url() };
+      return { ok: true, detail: await page.url() };
     }
 
     case "click_element": {
@@ -54,55 +51,108 @@ export async function execute(action, browser) {
       await browser.overlay("clearCandidates");
       await browser.overlay("highlight", action.targetId, HIGHLIGHT_MS);
       await browser.overlay("toast", label);
-      const loc = locatorFor(page, action.targetId);
-      await new Promise((r) => setTimeout(r, 180)); // let the human see the highlight
-      try {
-        await loc.click({ timeout: 4000 });
-      } catch {
-        await loc.evaluate((el) => el.click());
-      }
+      await new Promise((r) => setTimeout(r, 180)); // let the user see the highlight
+
+      const clicked = await page.evaluate((id) => {
+        const el = document.querySelector(`[data-vb-id="${id}"]`);
+        if (!el) return false;
+        el.scrollIntoView({ block: "center", inline: "nearest" });
+        el.click();
+        return true;
+      }, action.targetId);
+
       await settle(page);
       await maybeNewTab(browser, before);
-      return { ok: true, detail: browser.page.url() };
+      return { ok: Boolean(clicked), detail: await browser.page.url() };
     }
 
     case "type_into_field": {
       await browser.overlay("clearCandidates");
       await browser.overlay("highlight", action.targetId, HIGHLIGHT_MS + 400);
       await browser.overlay("toast", label);
-      const loc = locatorFor(page, action.targetId);
-      await loc.click({ timeout: 4000 }).catch(() => loc.focus());
-      await loc.fill("").catch(() => {});
-      await loc.pressSequentially(action.text, { delay: 18 }).catch(async () => loc.fill(action.text));
+
+      await page.evaluate(
+        ([id, text]) => {
+          const el = document.querySelector(`[data-vb-id="${id}"]`);
+          if (!el) return false;
+          el.scrollIntoView({ block: "center", inline: "nearest" });
+          el.focus();
+          const setter =
+            Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, "value")?.set ||
+            Object.getOwnPropertyDescriptor(window.HTMLTextAreaElement.prototype, "value")?.set;
+          if (setter) {
+            setter.call(el, text);
+          } else {
+            el.value = text;
+          }
+          el.dispatchEvent(new Event("input", { bubbles: true }));
+          el.dispatchEvent(new Event("change", { bubbles: true }));
+          return true;
+        },
+        [action.targetId, action.text],
+      );
+
       if (action.submit) {
-        await page.keyboard.press("Enter");
+        await page.send("Input.dispatchKeyEvent", {
+          type: "rawKeyDown",
+          windowsVirtualKeyCode: 13,
+          unmodifiedText: "\r",
+          text: "\r",
+        }).catch(() => {});
+        await page.send("Input.dispatchKeyEvent", {
+          type: "keyUp",
+          windowsVirtualKeyCode: 13,
+          unmodifiedText: "\r",
+          text: "\r",
+        }).catch(() => {});
+        await page.evaluate((id) => {
+          const el = document.querySelector(`[data-vb-id="${id}"]`);
+          if (el?.form) {
+            if (typeof el.form.requestSubmit === "function") el.form.requestSubmit();
+            else el.form.submit();
+          }
+        }, action.targetId).catch(() => {});
         await settle(page);
       }
-      return { ok: true, detail: page.url() };
+      return { ok: true, detail: await page.url() };
     }
 
     case "select_option": {
       await browser.overlay("highlight", action.targetId, HIGHLIGHT_MS);
       await browser.overlay("toast", label);
-      const loc = locatorFor(page, action.targetId);
-      // Match option by (case-insensitive, substring) label in code.
-      const picked = await loc.evaluate((sel, wanted) => {
-        const w = wanted.toLowerCase();
-        const opts = Array.from(sel.options || []);
-        const hit = opts.find((o) => o.label.toLowerCase() === w) || opts.find((o) => o.label.toLowerCase().includes(w));
-        if (!hit) return null;
-        sel.value = hit.value;
-        sel.dispatchEvent(new Event("change", { bubbles: true }));
-        return hit.label;
-      }, action.text);
+      const picked = await page.evaluate(
+        ([id, wanted]) => {
+          const sel = document.querySelector(`[data-vb-id="${id}"]`);
+          if (!sel) return null;
+          const w = wanted.toLowerCase();
+          const opts = Array.from(sel.options || []);
+          const hit = opts.find((o) => o.label.toLowerCase() === w) || opts.find((o) => o.label.toLowerCase().includes(w));
+          if (!hit) return null;
+          sel.value = hit.value;
+          sel.dispatchEvent(new Event("change", { bubbles: true }));
+          return hit.label;
+        },
+        [action.targetId, action.text],
+      );
       return { ok: Boolean(picked), detail: picked || "no matching option" };
     }
 
     case "press_enter":
       await browser.overlay("toast", "⏎ enter");
-      await page.keyboard.press("Enter");
+      await page.send("Input.dispatchKeyEvent", {
+        type: "rawKeyDown",
+        windowsVirtualKeyCode: 13,
+        unmodifiedText: "\r",
+        text: "\r",
+      }).catch(() => {});
+      await page.send("Input.dispatchKeyEvent", {
+        type: "keyUp",
+        windowsVirtualKeyCode: 13,
+        unmodifiedText: "\r",
+        text: "\r",
+      }).catch(() => {});
       await settle(page);
-      return { ok: true, detail: page.url() };
+      return { ok: true, detail: await page.url() };
 
     case "scroll_down":
     case "scroll_up": {
@@ -121,37 +171,36 @@ export async function execute(action, browser) {
         [dir, action.amount || "page"],
       );
       await page.waitForTimeout(350);
-      return { ok: true, detail: `scrollY=${await page.evaluate(() => Math.round(window.scrollY))}` };
+      const scrollY = await page.evaluate(() => Math.round(window.scrollY)).catch(() => 0);
+      return { ok: true, detail: `scrollY=${scrollY}` };
     }
 
     case "go_back":
       await browser.overlay("toast", "← back");
-      await page.goBack({ waitUntil: "domcontentloaded", timeout: NAV_TIMEOUT }).catch(() => {});
+      await page.goBack({ timeout: NAV_TIMEOUT }).catch(() => {});
       await settle(page, 800);
-      return { ok: true, detail: page.url() };
+      return { ok: true, detail: await page.url() };
 
     case "go_forward":
       await browser.overlay("toast", "→ forward");
-      await page.goForward({ waitUntil: "domcontentloaded", timeout: NAV_TIMEOUT }).catch(() => {});
+      await page.goForward({ timeout: NAV_TIMEOUT }).catch(() => {});
       await settle(page, 800);
-      return { ok: true, detail: page.url() };
+      return { ok: true, detail: await page.url() };
 
     case "reload":
       await browser.overlay("toast", "↻ reload");
-      await page.reload({ waitUntil: "domcontentloaded", timeout: NAV_TIMEOUT }).catch(() => {});
-      return { ok: true, detail: page.url() };
+      await page.reload({ timeout: NAV_TIMEOUT }).catch(() => {});
+      return { ok: true, detail: await page.url() };
 
     case "open_new_tab": {
-      const p = await browser.context.newPage();
+      const p = await browser.openNewTab();
       await browser.setActive(p);
       await browser.overlay("toast", "new tab");
       return { ok: true, detail: `tabs=${browser.pages.length}` };
     }
 
     case "close_tab": {
-      await page.close();
-      if (browser.pages.length === 0) await browser.context.newPage();
-      await browser.setActive(browser.page);
+      await browser.closeTab(page);
       return { ok: true, detail: `tabs=${browser.pages.length}` };
     }
 
@@ -165,7 +214,7 @@ export async function execute(action, browser) {
       else next = pages[(i + 1) % pages.length];
       await browser.setActive(next);
       await browser.overlay("toast", "switched tab");
-      return { ok: true, detail: next.url() };
+      return { ok: true, detail: await next.url() };
     }
 
     default:

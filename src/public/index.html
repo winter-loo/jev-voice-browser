@@ -74,8 +74,9 @@
 </head>
 <body>
 <header>
-  <h1><span>●</span> voice-browser <span class="small" style="color:var(--muted);font-weight:400">— Jev decides, Playwright acts</span></h1>
+  <h1><span>●</span> voice-browser <span class="small" style="color:var(--muted);font-weight:400">— Jev decides, CDP acts (port 9229)</span></h1>
   <span class="pill">model <b id="model">–</b></span>
+  <span class="pill">doubao <b id="doubaostate" style="color:var(--green)">connected</b></span>
   <span class="pill">last <b id="lat">–</b> ms · p50 <b id="p50">–</b> ms</span>
   <span class="pill">calls <b id="calls">0</b> · actions <b id="actions">0</b></span>
   <span class="pill">cost <b id="cost">$0.000000</b></span>
@@ -88,19 +89,27 @@
   <!-- LEFT: speech -->
   <div class="col">
     <div class="card">
-      <h2><span class="dot" id="micdot"></span> microphone <span class="r small" id="micstate">off</span></h2>
-      <div id="transcript"><span class="interim">Say something like “go to wikipedia”…</span></div>
+      <h2><span class="dot on" id="doubaodot"></span> doubao voice bridge <span class="r small" id="doubaophase">tcp 4387</span></h2>
+      <div id="transcript"><span class="interim">Say something like “打开维基百科” or “go to wikipedia”…</span></div>
       <div class="row" style="margin-top:10px">
-        <button class="primary" id="micbtn">Start mic</button>
+        <button class="primary" id="streamBtn">Start Mic Stream</button>
+        <button id="doubaobtn">Doubao Start</button>
         <button id="undo">Undo / back</button>
         <button id="resnap">Re-scan page</button>
       </div>
+      <div style="margin-top:10px">
+        <div class="row" style="justify-content:space-between;margin-bottom:3px">
+          <span class="small" id="streamState">Mic stream: idle</span>
+          <span class="small" style="color:var(--muted)">48kHz s16le → TCP 5004</span>
+        </div>
+        <div class="track" style="height:6px"><div id="audioLevel" class="fill win" style="width:0%"></div></div>
+      </div>
       <form id="cmdform" class="row" style="margin-top:10px">
-        <input type="text" id="cmd" placeholder="…or type a command and press Enter (no-mic fallback)" autocomplete="off" />
+        <input type="text" id="cmd" placeholder="…or type a command and press Enter" autocomplete="off" />
         <button type="submit">Run</button>
       </form>
       <div id="pending" class="small" style="margin-top:8px"></div>
-      <div class="small" style="margin-top:6px">Mic needs Chrome/Edge (Web Speech API). Partial transcripts stream to the server as you speak; each update = one Jev request (stale ones are cancelled).</div>
+      <div class="small" style="margin-top:6px">Browser mic (48kHz PCM) → Node.js → Mac Doubao (TCP 5004) → Jev model → Chrome (port 9229).</div>
     </div>
 
     <div class="card grow">
@@ -182,6 +191,7 @@
         case "candidates": candIds = new Set((payload || []).map((c) => c.id)); renderSnapshot(); break;
         case "pending": $("pending").textContent = payload ? `⚠ pending: ${payload.summary} — say "confirm" or "cancel"` : ""; break;
         case "tabs": $("tabs").textContent = `${payload.length} tab${payload.length === 1 ? "" : "s"}`; break;
+        case "doubao": renderDoubao(payload); break;
       }
     };
   }
@@ -285,34 +295,191 @@
     renderTranscript({ text, final: true, actedOn: false });
     $("cmd").value = "";
   });
+
+  // ------------------------------------------------------------ mic audio capture & streaming (48kHz s16le PCM)
+  let audioCtx = null;
+  let mediaStream = null;
+  let processor = null;
+  let source = null;
+  let isStreaming = false;
+
+  function resampleTo48k(inputFloat32, inSampleRate) {
+    if (inSampleRate === 48000) return inputFloat32;
+    const ratio = inSampleRate / 48000;
+    const outLength = Math.round(inputFloat32.length / ratio);
+    const result = new Float32Array(outLength);
+    for (let i = 0; i < outLength; i++) {
+      const pos = i * ratio;
+      const idx = Math.floor(pos);
+      const frac = pos - idx;
+      const next = idx + 1 < inputFloat32.length ? inputFloat32[idx + 1] : inputFloat32[idx];
+      result[i] = inputFloat32[idx] * (1 - frac) + next * frac;
+    }
+    return result;
+  }
+
+  function floatTo16BitPCM(float32Array) {
+    const buffer = new Int16Array(float32Array.length);
+    for (let i = 0; i < float32Array.length; i++) {
+      let s = Math.max(-1, Math.min(1, float32Array[i]));
+      buffer[i] = s < 0 ? s * 0x8000 : s * 0x7fff;
+    }
+    return buffer;
+  }
+
+  async function startAudioStream() {
+    if (isStreaming) return;
+    try {
+      const stream = await navigator.mediaDevices.getUserMedia({
+        audio: {
+          echoCancellation: true,
+          noiseSuppression: true,
+          autoGainControl: true,
+          channelCount: 1,
+        }
+      });
+      mediaStream = stream;
+
+      const AudioContextClass = window.AudioContext || window.webkitAudioContext;
+      try {
+        audioCtx = new AudioContextClass({ sampleRate: 48000 });
+      } catch {
+        audioCtx = new AudioContextClass();
+      }
+      if (audioCtx.state === "suspended") {
+        await audioCtx.resume();
+      }
+
+      source = audioCtx.createMediaStreamSource(stream);
+      // 4096 samples at 48kHz is ~85ms buffer
+      processor = audioCtx.createScriptProcessor(4096, 1, 1);
+
+      processor.onaudioprocess = (e) => {
+        if (!isStreaming) return;
+        const input = e.inputBuffer.getChannelData(0);
+
+        // Calculate RMS volume for visual meter
+        let sum = 0;
+        for (let i = 0; i < input.length; i++) sum += input[i] * input[i];
+        const rms = Math.sqrt(sum / input.length);
+        const levelPct = Math.min(100, Math.round(rms * 450));
+        $("audioLevel").style.width = `${levelPct}%`;
+
+        // Resample if necessary to 48000Hz
+        const resampled = resampleTo48k(input, audioCtx.sampleRate);
+
+        // Convert to 16-bit PCM (s16le)
+        const pcm16 = floatTo16BitPCM(resampled);
+
+        // Stream raw binary buffer over WebSocket
+        if (ws && ws.readyState === WebSocket.OPEN) {
+          ws.send(pcm16.buffer);
+        }
+      };
+
+      source.connect(processor);
+      processor.connect(audioCtx.destination);
+
+      isStreaming = true;
+      send({ type: "audio_start" });
+
+      $("streamBtn").textContent = "Stop Mic Stream";
+      $("streamBtn").classList.remove("primary");
+      $("streamBtn").classList.add("danger");
+      $("streamState").textContent = "Mic stream: active (48kHz → TCP 5004)";
+      $("streamState").style.color = "var(--green)";
+      appendLog({ level: "info", t: Date.now(), msg: `Mic stream started (${audioCtx.sampleRate}Hz -> 48kHz s16le PCM -> TCP 5004)` });
+    } catch (err) {
+      console.error("Failed to start mic stream:", err);
+      appendLog({ level: "fail", t: Date.now(), msg: `Mic capture error: ${err.message}` });
+      stopAudioStream();
+    }
+  }
+
+  function stopAudioStream() {
+    isStreaming = false;
+    if (processor) {
+      try { processor.disconnect(); } catch {}
+      processor = null;
+    }
+    if (source) {
+      try { source.disconnect(); } catch {}
+      source = null;
+    }
+    if (mediaStream) {
+      try { mediaStream.getTracks().forEach((t) => t.stop()); } catch {}
+      mediaStream = null;
+    }
+    if (audioCtx) {
+      try { audioCtx.close(); } catch {}
+      audioCtx = null;
+    }
+    send({ type: "audio_stop" });
+
+    $("streamBtn").textContent = "Start Mic Stream";
+    $("streamBtn").classList.add("primary");
+    $("streamBtn").classList.remove("danger");
+    $("streamState").textContent = "Mic stream: idle";
+    $("streamState").style.color = "inherit";
+    $("audioLevel").style.width = "0%";
+    appendLog({ level: "info", t: Date.now(), msg: "Mic stream stopped" });
+  }
+
+  $("streamBtn").onclick = () => {
+    if (isStreaming) {
+      stopAudioStream();
+    } else {
+      startAudioStream();
+    }
+  };
+
+  let doubaoRecording = false;
+  function renderDoubao(p) {
+    if (p.status === "connected") {
+      $("doubaostate").textContent = "connected";
+      $("doubaostate").style.color = "var(--green)";
+      $("doubaodot").className = "dot on";
+      $("doubaophase").textContent = `tcp ${p.port}`;
+    } else if (p.status === "disconnected") {
+      $("doubaostate").textContent = "disconnected";
+      $("doubaostate").style.color = "var(--red)";
+      $("doubaodot").className = "dot";
+      $("doubaophase").textContent = "reconnecting…";
+    } else if (p.status === "audio_connected") {
+      appendLog({ level: "info", t: Date.now(), msg: `Doubao audio TCP ${p.audioPort} ready` });
+    } else if (p.status === "phase") {
+      $("doubaophase").textContent = p.phase;
+      if (p.phase === "recording") {
+        doubaoRecording = true;
+        $("doubaobtn").textContent = "Doubao Stop";
+        $("doubaobtn").classList.remove("primary");
+        $("doubaobtn").classList.add("danger");
+      } else if (p.phase === "final" || p.phase === "idle") {
+        doubaoRecording = false;
+        $("doubaobtn").textContent = "Doubao Start";
+        $("doubaobtn").classList.add("primary");
+        $("doubaobtn").classList.remove("danger");
+      }
+    }
+  }
+
+  $("doubaobtn").onclick = () => {
+    doubaoRecording = !doubaoRecording;
+    if (doubaoRecording) {
+      send({ type: "doubao_start" });
+      $("doubaobtn").textContent = "Doubao Stop";
+      $("doubaobtn").classList.remove("primary");
+      $("doubaobtn").classList.add("danger");
+    } else {
+      send({ type: "doubao_stop" });
+      $("doubaobtn").textContent = "Doubao Start";
+      $("doubaobtn").classList.add("primary");
+      $("doubaobtn").classList.remove("danger");
+    }
+  };
+
   $("undo").onclick = () => send({ type: "undo" });
   $("resnap").onclick = () => send({ type: "snapshot" });
-
-  // ------------------------------------------------------------ speech
-  const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
-  let rec = null, micOn = false, utteranceBase = 0;
-  function startMic() {
-    if (!SR) { alert("Web Speech API not available. Use Chrome or Edge, or type commands below."); return; }
-    rec = new SR();
-    rec.continuous = true; rec.interimResults = true; rec.lang = "en-US"; rec.maxAlternatives = 1;
-    rec.onresult = (ev) => {
-      // Results before ev.resultIndex are finished. Each result index is a distinct utterance.
-      for (let i = ev.resultIndex; i < ev.results.length; i++) {
-        const r = ev.results[i];
-        const text = r[0].transcript;
-        send({ type: "transcript", text, final: r.isFinal, utteranceId: `u${utteranceBase}-${i}` });
-      }
-    };
-    rec.onerror = (e) => { $("micstate").textContent = "error: " + e.error; if (e.error === "not-allowed") stopMic(); };
-    rec.onend = () => { if (micOn) { utteranceBase += 1; try { rec.start(); } catch {} } };
-    rec.start();
-    micOn = true; $("micdot").classList.add("on"); $("micstate").textContent = "listening"; $("micbtn").textContent = "Stop mic"; $("micbtn").classList.remove("primary");
-  }
-  function stopMic() {
-    micOn = false; try { rec && rec.stop(); } catch {}
-    $("micdot").classList.remove("on"); $("micstate").textContent = "off"; $("micbtn").textContent = "Start mic"; $("micbtn").classList.add("primary");
-  }
-  $("micbtn").onclick = () => (micOn ? stopMic() : startMic());
 
   connect();
 })();

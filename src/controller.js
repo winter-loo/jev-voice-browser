@@ -80,7 +80,9 @@ export class Controller extends EventEmitter {
     if (consumed && consumed.id === utteranceId) {
       if (!clean.toLowerCase().startsWith(consumed.prefix)) return; // recognizer revised the executed words; ignore
       clean = clean.slice(consumed.prefix.length).trim();
-      if (clean.split(/\s+/).filter(Boolean).length < 2) return;
+      const words = clean.split(/\s+/).filter(Boolean);
+      const hasCJK = /[\u4e00-\u9fa5]/.test(clean);
+      if (hasCJK ? clean.length < 2 : words.length < 2) return;
       virtualId = `${utteranceId}+${consumed.gen}`;
     }
 

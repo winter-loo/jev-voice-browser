@@ -1,15 +1,17 @@
 /**
- * Node server: serves the control page, bridges WebSocket <-> Controller, owns the API key.
+ * Node server: serves the control page, bridges WebSocket <-> Controller,
+ * integrates Doubao Voice Bridge (TCP 4387 control & TCP 5004 audio) and native CDP browser (port 9229).
  *
- *   node src/server.js [--port 8787] [--host 127.0.0.1] [--headless] [--cdp ws://127.0.0.1:9222/devtools/browser/...] [--start-url https://...]
+ *   node src/server.js [--port 8787] [--cdp http://127.0.0.1:9229] [--doubao-host 127.0.0.1] [--doubao-port 4387] [--doubao-audio-port 5004]
  */
 import http from "node:http";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import express from "express";
 import { WebSocketServer } from "ws";
-import { BrowserManager } from "./browser.js";
+import { BrowserManager, DEFAULT_CDP_ENDPOINT } from "./browser.js";
 import { Controller } from "./controller.js";
+import { DoubaoBridgeClient } from "./doubao.js";
 import { hasApiKey } from "./jev.js";
 import { MODEL, QUESTIONS, T } from "./constants.js";
 
@@ -18,19 +20,21 @@ const __dirname = path.dirname(fileURLToPath(import.meta.url));
 export function parseArgs(argv) {
   const out = {
     port: Number(process.env.PORT) || 8787,
-    // Bind to loopback only by default: anyone who can reach this port can drive the browser
-    // and spend your API credits. Use --host 0.0.0.0 deliberately if you need LAN access.
     host: process.env.HOST || "127.0.0.1",
-    headless: false,
-    cdp: null,
+    cdp: process.env.CDP_URL || DEFAULT_CDP_ENDPOINT,
+    doubaoHost: process.env.DOUBAO_HOST || "127.0.0.1",
+    doubaoPort: Number(process.env.DOUBAO_PORT) || 4387,
+    doubaoAudioPort: Number(process.env.DOUBAO_AUDIO_PORT) || 5004,
     startUrl: "https://example.com/",
   };
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i];
     if (a === "--port") out.port = Number(argv[++i]);
     else if (a === "--host") out.host = argv[++i];
-    else if (a === "--headless") out.headless = true;
     else if (a === "--cdp") out.cdp = argv[++i];
+    else if (a === "--doubao-host") out.doubaoHost = argv[++i];
+    else if (a === "--doubao-port") out.doubaoPort = Number(argv[++i]);
+    else if (a === "--doubao-audio-port") out.doubaoAudioPort = Number(argv[++i]);
     else if (a === "--start-url") out.startUrl = argv[++i];
   }
   return out;
@@ -41,10 +45,19 @@ export async function startServer(opts = {}) {
     console.error("Missing TYPESAFE_API_KEY (or JEV_API_KEY). Use ./run.sh or export it first.");
     process.exit(1);
   }
+
+  const cdpEndpoint = opts.cdp || DEFAULT_CDP_ENDPOINT;
   const browser = new BrowserManager();
-  await browser.launch({ headless: opts.headless, cdp: opts.cdp, startUrl: opts.startUrl });
+  await browser.launch({ cdp: cdpEndpoint, startUrl: opts.startUrl });
+
   const controller = new Controller({ browser });
   await controller.start();
+
+  const doubao = new DoubaoBridgeClient({
+    host: opts.doubaoHost || "127.0.0.1",
+    port: opts.doubaoPort || 4387,
+    audioPort: opts.doubaoAudioPort || 5004,
+  });
 
   const app = express();
   app.use(express.static(path.join(__dirname, "public")));
@@ -68,9 +81,48 @@ export async function startServer(opts = {}) {
   controller.on("pending", (p) => broadcast("pending", p));
   controller.on("tabs", (p) => broadcast("tabs", p));
 
+  // Forward Doubao voice events
+  doubao.on("connected", (info) => {
+    console.log(`[Doubao] Connected to Doubao Voice Bridge at ${info.host}:${info.port}`);
+    broadcast("doubao", { status: "connected", host: info.host, port: info.port });
+  });
+
+  doubao.on("disconnected", () => {
+    console.log("[Doubao] Disconnected from Doubao Voice Bridge (will retry...)");
+    broadcast("doubao", { status: "disconnected" });
+  });
+
+  doubao.on("audio_connected", (info) => {
+    console.log(`[Doubao] Audio stream connected to ${info.host}:${info.port}`);
+    broadcast("doubao", { status: "audio_connected", audioPort: info.port });
+  });
+
+  doubao.on("phase", (phase) => {
+    broadcast("doubao", { status: "phase", phase });
+  });
+
+  doubao.on("transcript", ({ text, final, utteranceId }) => {
+    controller.handleTranscript({ text, final, utteranceId });
+  });
+
+  doubao.connect();
+
   wss.on("connection", (ws) => {
-    ws.send(JSON.stringify({ type: "hello", payload: controller.uiState() }));
-    ws.on("message", async (raw) => {
+    ws.send(JSON.stringify({
+      type: "hello",
+      payload: {
+        ...controller.uiState(),
+        doubaoConnected: doubao.connected,
+      },
+    }));
+
+    ws.on("message", async (raw, isBinary) => {
+      // Direct binary audio stream from browser microphone -> forward to Doubao audio port (5004)
+      if (isBinary) {
+        doubao.writeAudio(raw);
+        return;
+      }
+
       let msg;
       try {
         msg = JSON.parse(raw.toString());
@@ -90,6 +142,14 @@ export async function startServer(opts = {}) {
         case "snapshot":
           controller.refreshSnapshot();
           break;
+        case "audio_start":
+        case "doubao_start":
+          doubao.startSession();
+          break;
+        case "audio_stop":
+        case "doubao_stop":
+          doubao.stopSession();
+          break;
         case "state":
           ws.send(JSON.stringify({ type: "hello", payload: controller.uiState() }));
           break;
@@ -102,13 +162,12 @@ export async function startServer(opts = {}) {
   const host = opts.host || "127.0.0.1";
   await new Promise((resolve) => server.listen(opts.port, host, resolve));
   const url = `http://localhost:${opts.port}`;
-  if (host !== "127.0.0.1" && host !== "localhost") {
-    console.warn(`WARNING: listening on ${host} — anyone who can reach this port can control the browser and spend API credits.`);
-  }
-  console.log(`\nvoice-browser ready → open ${url} in Chrome (mic needs Chrome/Edge)`);
-  console.log(`model ${MODEL} · controlled window: ${opts.cdp ? "attached via CDP" : opts.headless ? "headless" : "headed Chromium"}\n`);
+
+  console.log(`\nvoice-browser ready → open ${url}`);
+  console.log(`model ${MODEL} · browser CDP: ${cdpEndpoint} · Doubao Bridge: ${doubao.host}:${doubao.port} (audio: ${doubao.audioPort})\n`);
 
   const shutdown = async () => {
+    doubao.close();
     await controller.close();
     await browser.close();
     server.close();
@@ -116,7 +175,7 @@ export async function startServer(opts = {}) {
   };
   process.on("SIGINT", shutdown);
   process.on("SIGTERM", shutdown);
-  return { app, server, controller, browser, url };
+  return { app, server, controller, browser, doubao, url };
 }
 
 if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {

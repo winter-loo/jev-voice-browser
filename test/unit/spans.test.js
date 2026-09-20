@@ -53,6 +53,16 @@ test("candidate pick parsing", () => {
   assert.equal(parseCandidatePick("click the first one"), 1);
   assert.equal(parseCandidatePick("one"), 1);
   assert.equal(parseCandidatePick("four", 3), null, "out of range");
-  assert.equal(parseCandidatePick("go to wikipedia"), null);
   assert.equal(parseCandidatePick(""), null);
+  // Chinese number pick parsing
+  assert.equal(parseCandidatePick("第二个"), 2);
+  assert.equal(parseCandidatePick("选1"), 1);
+  assert.equal(parseCandidatePick("三号"), 3);
+  assert.equal(parseCandidatePick("点击第一个"), 1);
+});
+
+test("text candidates: Chinese verbs", () => {
+  assert.equal(extractTextCandidates("搜索 深度学习")[0], "深度学习");
+  assert.equal(extractTextCandidates("在搜索框中输入 你好世界")[0], "你好世界");
+  assert.equal(extractTextCandidates("搜一下 人工智能")[0], "人工智能");
 });

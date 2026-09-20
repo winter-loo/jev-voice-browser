@@ -1,61 +1,58 @@
 # voice-browser — talk to a real browser, it acts before you finish the sentence
 
-A Node app that controls a **headed Chromium window** (Playwright) by voice. Speech is streamed
-word by word from the browser's Web Speech API to a small Node server; on every partial transcript
-the server asks **Jev** (TypeSafe's System One model, `jev-1.13.0`) one request with a dozen typed
-questions — intent, target element, site, "is the command complete?", "is this even addressed to
-me?", "is it destructive?" — gets typed probabilities back in ~250–350 ms, and code decides whether
-to act, wait, ask, or ignore.
+A Node app that controls a **real Chromium window via native CDP** (Chrome DevTools Protocol on port 9229) by voice.
+Speech is streamed either directly from the **browser microphone (48kHz s16le PCM via Web Audio API + WebSocket)** or from a local **Doubao Voice Bridge** (TCP 4387 & TCP 5004); on every partial transcript the server asks **Jev** (TypeSafe's System One model, `jev-1.13.0`) one request with a dozen typed questions — intent, target element, site, "is the command complete?", "is this even addressed to me?", "is it destructive?" — gets typed probabilities back in ~250–350 ms, and code decides whether to act, wait, ask, or ignore.
 
-Jev never generates text. Search queries, typed text and URLs are extracted as candidate spans by
-code and Jev only *picks* one, which is copied verbatim.
+Jev never generates text. Search queries, typed text and URLs are extracted as candidate spans by code and Jev only *picks* one, which is copied verbatim. Both English and Chinese voice commands are supported.
 
 ```
- mic (Chrome, Web Speech API)          Node server (owns the API key)             controlled window
- ───────────────────────────    ws     ───────────────────────────────────         ──────────────────
- partial transcripts  ───────────────▶ debounce 200 ms                            headed Chromium via
- "go to"  "go to wiki"                 snapshot page (≤100 elements, e01..eNN) ◀── Playwright, persistent
- "go to wikipedia" (final)             ONE Jev request: 9–11 questions             profile, overlay
-                                       policy (thresholds in constants.js)  ───▶  highlight / toast /
- control page ◀─────────────────────── decision + bars + latency + cost            numbered candidates
+ mic (Web Audio API, 48kHz PCM)       Node server (jev-voice-browser)             controlled window
+ ──────────────────────────────    ws  ───────────────────────────────             ─────────────────
+ binary PCM audio chunks ─────────▶ forward to TCP 5004 (Doubao audio)            Chrome (native CDP
+                                       ▲                                           port 9229, no
+                                       │ TCP 4387 (partials / text)                Playwright needed)
+                                   Doubao Voice Bridge                            
+                                       ▼
+                                   debounce 200 ms
+                                   snapshot page (≤100 elements, e01..eNN) ◀───── query DOM via CDP
+                                   ONE Jev request: 9–11 questions
+                                   policy (thresholds in constants.js)  ────────▶ click / fill / scroll
+ control page ◀─────────────────── decision + bars + latency + cost                numbered candidates
 ```
 
 ## Run it
 
-Requirements: Node ≥ 20 (tested on 22), npm, Chrome or Edge for the microphone (the Web Speech API
-is not available in Firefox/Safari). Real API calls cost ~$0.0002 each.
+Requirements: Node ≥ 20 (tested on 22), npm, a running Chrome with CDP enabled (`--remote-debugging-port=9229`), and Doubao Voice Bridge (or the browser microphone). Real API calls cost ~$0.0002 each.
 
 ```bash
-git clone https://github.com/moritzkremb/jev-voice-browser.git
+git clone https://github.com/winter-loo/jev-voice-browser.git
 cd jev-voice-browser
 npm install
-npx playwright install chromium
 cp .env.example .env          # paste your TypeSafe API key (https://console.typesafe.ai/keys)
 ./run.sh                      # starts the server on http://localhost:8787
 ```
 
-Then open **http://localhost:8787 in your normal Chrome**, click **Start mic**, allow the
-microphone, and speak. A separate Chromium window (the *controlled* browser) is opened by the server;
-that is the one that acts. Keep the control page visible on a second screen / half the screen for
-the live probability bars.
-
-Options: `./run.sh --port 9000`, `--host 0.0.0.0` (LAN, see Security), `--start-url https://…`, `--headless` (CI), or attach to a Chrome
-you already have running instead of launching one:
+### Start Chrome with CDP on port 9229
 
 ```bash
-# start your Chrome with a debugging port, then:
-./run.sh --cdp http://127.0.0.1:9222
+# macOS
+/Applications/Google\ Chrome.app/Contents/MacOS/Google\ Chrome --remote-debugging-port=9229
+
+# Linux / Windows
+google-chrome --remote-debugging-port=9229
 ```
+
+Then open **http://localhost:8787** (or `http://<server-ip>:8787` from another LAN machine) in any browser, click **Start Mic Stream**, allow the microphone, and speak. The server captures 48kHz PCM, routes it to Doubao Voice Bridge, feeds Jev in real time, and controls your 9229 Chrome window.
+
+Options: `./run.sh --port 8787 --cdp http://127.0.0.1:9229 --doubao-port 4387 --doubao-audio-port 5004`
 
 Set the key yourself instead of `.env`: `export TYPESAFE_API_KEY=…` (legacy `JEV_API_KEY` is
 also accepted) and `npm start`. The key is only ever read by the Node process; the control page
 never sees it.
 
-**Security:** the server listens on `127.0.0.1` only. Anyone who can reach the control port can
+**Security:** the server listens on `127.0.0.1` only by default. Anyone who can reach the control port can
 drive the browser and spend your API credits, so only use `--host 0.0.0.0` on a network you trust.
-The controlled Chromium uses a persistent profile in `.browser-profile/` (gitignored) — don't log
-into accounts there that you wouldn't want a mis-heard "click place order" to touch; destructive
-clicks require a spoken "confirm", but treat that as a convenience, not a guarantee.
+Destructive clicks require a spoken "confirm", but treat that as a convenience, not a guarantee.
 
 No microphone? Type a command into the text box on the control page and press Enter.
 
@@ -125,11 +122,13 @@ src/jev.js         builds state + questions, calls @typesafe-ai/sdk, returns ans
 src/spans.js       candidate extraction (text payloads, spoken URLs, number words) — code, not Jev
 src/snapshot.js    in-page element collector (tags data-vb-id), compaction + size guard, site detection
 src/policy.js      answers → act / wait / ignore / confirm / disambiguate, with reasons
-src/executor.js    Playwright actions + overlay feedback
-src/browser.js     launch headed Chromium (persistent profile) or attach via CDP; tabs
+src/cdp.js         lightweight native CDP client (ws/http) for Chrome communication
+src/doubao.js      TCP client for Doubao Voice Bridge (TCP 4387 control, TCP 5004 audio)
+src/executor.js    CDP actions + overlay feedback
+src/browser.js     native CDP page/tab manager attached to port 9229
 src/overlay.js     injected highlight / toast / numbered badges
 src/controller.js  debounce, in-flight management, one action per utterance, chaining, stats
-src/server.js      Express + ws, serves src/public/index.html (control page)
+src/server.js      Express + ws, serves src/public/index.html (control page) & bridges mic audio
 scripts/demo.js    word-by-word replay against real sites = end-to-end test
 test/unit/         spans, snapshot compaction, policy (mocked Jev), controller (mocked Jev + browser)
 test/integration/  27 real-API cases on captured page fixtures, prints pass rate + latency

@@ -20,11 +20,17 @@ const TEXT_VERBS = [
   /\bwrite\s+/i,
   /\bput\s+/i,
   /\bfill\s+(?:in\s+)?/i,
+  // Chinese payload verbs with destination prefix (must come before generic verbs)
+  /(?:在|到)?(?:搜索框|输入框|评论框|文本框)(?:中|里|内)?\s*(?:输入|键入|打入|填写|写)\s*/i,
+  /(?:在|到)?(?:搜索框|输入框|评论框|文本框)(?:中|里|内)?\s*(?:搜索|搜一下|搜|查找|查询)\s*(?:关于)?\s*/i,
+  /(?:在|去)?(?:谷歌|百度|必应|维基百科|youtube|b站|github|知乎)\s*(?:上|里)?(?:搜索|搜一下|搜|查找)\s*(?:关于)?\s*/i,
+  /(?:搜索|搜一下|搜|查找|查询)\s*(?:关于)?\s*/i,
+  /(?:输入|键入|打入|填写|写)\s*/i,
 ];
 
 // Trailing destination phrases to strip from a payload: "... into the search box".
 const TRAILING_DEST_RE =
-  /\s+(?:in|into|on|inside|to)\s+(?:the\s+)?(?:[\w-]+\s+){0,4}?(?:box|field|input|bar|form|textarea|search|wikipedia|youtube|google|duckduckgo|github|amazon|reddit|twitter|x|web)\b.*$/i;
+  /(?:\s+(?:in|into|on|inside|to)\s+(?:the\s+)?(?:[\w-]+\s+){0,4}?(?:box|field|input|bar|form|textarea|search|wikipedia|youtube|google|duckduckgo|github|amazon|reddit|twitter|x|web)\b.*$)|(?:\s*(?:到|在)?(?:搜索框|输入框|评论框|文本框)(?:里|中|内)?$)/i;
 
 // Leading site phrases: "wikipedia for cats" -> "cats", "on wikipedia cats" (rare)
 const LEADING_SITE_RE =
@@ -117,11 +123,11 @@ export function toHttpUrl(domainish) {
 }
 
 const NUMBER_WORDS = {
-  one: 1, first: 1, "1": 1, "1st": 1,
-  two: 2, second: 2, "2": 2, "2nd": 2,
-  three: 3, third: 3, "3": 3, "3rd": 3,
-  four: 4, fourth: 4, "4": 4, "4th": 4,
-  five: 5, fifth: 5, "5": 5, "5th": 5,
+  one: 1, first: 1, "1": 1, "1st": 1, 一: 1, 第一个: 1, 第1个: 1, 第1: 1, "1号": 1, "一号": 1, 选1: 1, 选一: 1,
+  two: 2, second: 2, "2": 2, "2nd": 2, 二: 2, 第二个: 2, 第2个: 2, 第2: 2, "2号": 2, "二号": 2, 两: 2, 选2: 2, 选二: 2,
+  three: 3, third: 3, "3": 3, "3rd": 3, 三: 3, 第三个: 3, 第3个: 3, 第3: 3, "3号": 3, "三号": 3, 选3: 3, 选三: 3,
+  four: 4, fourth: 4, "4": 4, "4th": 4, 四: 4, 第四个: 4, 第4个: 4, 第4: 4, "4号": 4, "四号": 4, 选4: 4, 选四: 4,
+  five: 5, fifth: 5, "5": 5, "5th": 5, 五: 5, 第五个: 5, 第5个: 5, 第5: 5, "5号": 5, "五号": 5, 选5: 5, 选五: 5,
 };
 // Speech-recognizer homophones, only trusted when they are the whole utterance ("to" alone).
 const NUMBER_HOMOPHONES = { won: 1, to: 2, too: 2, for: 4 };
@@ -133,11 +139,20 @@ const NUMBER_HOMOPHONES = { won: 1, to: 2, too: 2, for: 4 };
  */
 const PICK_STOPWORDS = new Set([
   "the", "number", "option", "pick", "choose", "select", "click", "take", "that", "please", "link", "item", "result", "go", "with", "on", "yes", "this", "um", "uh",
+  "第", "个", "号", "选", "项", "点击", "点", "选择", "打开",
 ]);
 
 export function parseCandidatePick(transcript, max = 5) {
-  const t = cleanTranscript(transcript).toLowerCase().replace(/[.,!?]/g, "");
+  const t = cleanTranscript(transcript).toLowerCase().replace(/[.,!?，。！？]/g, "");
   if (!t) return null;
+
+  // Direct match without spaces for Chinese / single word
+  let compact = t.replace(/\s+/g, "");
+  compact = compact.replace(/^(?:点击|点|选择|选|打开|去)/, "");
+  if (NUMBER_WORDS[compact] && NUMBER_WORDS[compact] <= max) {
+    return NUMBER_WORDS[compact];
+  }
+
   const meaningful = t.split(" ").filter((w) => !PICK_STOPWORDS.has(w));
   if (meaningful.length === 0 || meaningful.length > 2) return null;
   for (const w of meaningful) {
