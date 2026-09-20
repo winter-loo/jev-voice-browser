@@ -4,8 +4,11 @@
  *
  *   node src/server.js [--port 8787] [--cdp http://127.0.0.1:9229] [--doubao-host 127.0.0.1] [--doubao-port 4387] [--doubao-audio-port 5004]
  */
+import fs from "node:fs";
 import http from "node:http";
+import https from "node:https";
 import path from "node:path";
+import { execSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import express from "express";
 import { WebSocketServer } from "ws";
@@ -21,6 +24,9 @@ export function parseArgs(argv) {
   const out = {
     port: Number(process.env.PORT) || 8787,
     host: process.env.HOST || "127.0.0.1",
+    https: Boolean(process.env.HTTPS) || false,
+    sslCert: process.env.SSL_CERT || null,
+    sslKey: process.env.SSL_KEY || null,
     cdp: process.env.CDP_URL || DEFAULT_CDP_ENDPOINT,
     doubaoHost: process.env.DOUBAO_HOST || "127.0.0.1",
     doubaoPort: Number(process.env.DOUBAO_PORT) || 4387,
@@ -31,6 +37,9 @@ export function parseArgs(argv) {
     const a = argv[i];
     if (a === "--port") out.port = Number(argv[++i]);
     else if (a === "--host") out.host = argv[++i];
+    else if (a === "--https") out.https = true;
+    else if (a === "--ssl-cert") out.sslCert = argv[++i];
+    else if (a === "--ssl-key") out.sslKey = argv[++i];
     else if (a === "--cdp") out.cdp = argv[++i];
     else if (a === "--doubao-host") out.doubaoHost = argv[++i];
     else if (a === "--doubao-port") out.doubaoPort = Number(argv[++i]);
@@ -64,7 +73,27 @@ export async function startServer(opts = {}) {
   app.get("/api/state", (_req, res) => res.json(controller.uiState()));
   app.get("/api/questions", (_req, res) => res.json({ model: MODEL, thresholds: T, questions: QUESTIONS }));
 
-  const server = http.createServer(app);
+  let server;
+  if (opts.https) {
+    let key, cert;
+    if (opts.sslKey && opts.sslCert) {
+      key = fs.readFileSync(opts.sslKey);
+      cert = fs.readFileSync(opts.sslCert);
+    } else {
+      const certDir = path.join(__dirname, "..", ".cert");
+      const keyPath = path.join(certDir, "key.pem");
+      const certPath = path.join(certDir, "cert.pem");
+      if (!fs.existsSync(keyPath) || !fs.existsSync(certPath)) {
+        fs.mkdirSync(certDir, { recursive: true });
+        execSync(`openssl req -x509 -newkey rsa:2048 -nodes -sha256 -subj '/CN=localhost' -keyout "${keyPath}" -out "${certPath}" -days 365`, { stdio: "ignore" });
+      }
+      key = fs.readFileSync(keyPath);
+      cert = fs.readFileSync(certPath);
+    }
+    server = https.createServer({ key, cert }, app);
+  } else {
+    server = http.createServer(app);
+  }
   const wss = new WebSocketServer({ server });
 
   const broadcast = (type, payload) => {
@@ -161,9 +190,14 @@ export async function startServer(opts = {}) {
 
   const host = opts.host || "127.0.0.1";
   await new Promise((resolve) => server.listen(opts.port, host, resolve));
-  const url = `http://localhost:${opts.port}`;
+  const scheme = opts.https ? "https" : "http";
+  const displayHost = host === "0.0.0.0" ? "localhost" : host;
+  const url = `${scheme}://${displayHost}:${opts.port}`;
 
   console.log(`\nvoice-browser ready → open ${url}`);
+  if (opts.https) {
+    console.log(`(HTTPS enabled for secure context — accept self-signed certificate if prompted)`);
+  }
   console.log(`model ${MODEL} · browser CDP: ${cdpEndpoint} · Doubao Bridge: ${doubao.host}:${doubao.port} (audio: ${doubao.audioPort})\n`);
 
   const shutdown = async () => {

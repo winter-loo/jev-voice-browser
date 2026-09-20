@@ -176,7 +176,8 @@
 
   // ------------------------------------------------------------ websocket
   function connect() {
-    ws = new WebSocket(`ws://${location.host}`);
+    const proto = location.protocol === "https:" ? "wss:" : "ws:";
+    ws = new WebSocket(`${proto}//${location.host}`);
     ws.onopen = () => { $("ws").textContent = "connected"; };
     ws.onclose = () => { $("ws").textContent = "disconnected — retrying"; setTimeout(connect, 1000); };
     ws.onmessage = (ev) => {
@@ -330,6 +331,14 @@
   async function startAudioStream() {
     if (isStreaming) return;
     try {
+      if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+        const isNotSecure = window.isSecureContext === false;
+        const msg = isNotSecure
+          ? "浏览器安全限制：HTTP 局域网 IP 禁止调用麦克风。请在 Chrome 打开 chrome://flags/#unsafely-treat-insecure-origin-as-secure 添加当前地址，或使用 SSH 转发 (ssh -L 8787:localhost:8787)，或开启 HTTPS。"
+          : "当前浏览器不支持录音 API (navigator.mediaDevices.getUserMedia)。";
+        alert(msg);
+        throw new Error(msg);
+      }
       const stream = await navigator.mediaDevices.getUserMedia({
         audio: {
           echoCancellation: true,
@@ -480,6 +489,11 @@
 
   $("undo").onclick = () => send({ type: "undo" });
   $("resnap").onclick = () => send({ type: "snapshot" });
+
+  if (window.isSecureContext === false && location.hostname !== "localhost" && location.hostname !== "127.0.0.1") {
+    $("streamState").textContent = "⚠ 非安全上下文: 麦克风受限 (需配置 flags 或 HTTPS)";
+    $("streamState").style.color = "var(--red)";
+  }
 
   connect();
 })();
