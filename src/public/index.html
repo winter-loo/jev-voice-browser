@@ -69,7 +69,11 @@
   .dot{width:10px;height:10px;border-radius:50%;background:#4b5563;display:inline-block}
   .dot.on{background:var(--red);box-shadow:0 0 0 4px rgba(239,68,68,.25);animation:pulse 1.2s infinite}
   @keyframes pulse{0%{box-shadow:0 0 0 0 rgba(239,68,68,.45)}100%{box-shadow:0 0 0 8px rgba(239,68,68,0)}}
-  .badge{display:inline-block;min-width:20px;text-align:center;background:var(--blue);color:#fff;border-radius:999px;font-weight:700;font-size:12px;padding:1px 6px}
+  .dot.recording{background:var(--accent);box-shadow:0 0 0 4px rgba(245,158,11,.25);animation:pulse 1.2s infinite}
+  .step-card{background:var(--panel2);border:1px solid var(--line);border-radius:6px;padding:6px 8px;display:flex;flex-direction:column;gap:3px}
+  .step-card .voice{color:var(--accent);font-weight:600}
+  .step-card .act{color:var(--green);font-family:ui-monospace,monospace;font-size:11.5px}
+  .step-card .meta{color:var(--muted);font-size:11px}
   #pending{color:var(--red);font-weight:600}
 </style>
 </head>
@@ -78,6 +82,7 @@
   <h1><span>●</span> voice-browser <span class="small" style="color:var(--muted);font-weight:400">— Jev decides, CDP acts (port 9229)</span></h1>
   <span class="pill">model <b id="model">–</b></span>
   <span class="pill">doubao <b id="doubaostate" style="color:var(--green)">connected</b></span>
+  <span class="pill">teaching <b id="teachpill" style="color:var(--muted)">idle</b></span>
   <span class="pill">last <b id="lat">–</b> ms · p50 <b id="p50">–</b> ms</span>
   <span class="pill">calls <b id="calls">0</b> · actions <b id="actions">0</b></span>
   <span class="pill">cost <b id="cost">$0.000000</b></span>
@@ -87,7 +92,7 @@
 </header>
 
 <main>
-  <!-- LEFT: speech -->
+  <!-- LEFT: speech & teaching -->
   <div class="col">
     <div class="card">
       <h2><span class="dot on" id="doubaodot"></span> doubao voice bridge <span class="r small" id="doubaophase">tcp 4387</span></h2>
@@ -111,6 +116,25 @@
       </form>
       <div id="pending" class="small" style="margin-top:8px"></div>
       <div class="small" style="margin-top:6px">Browser mic (48kHz PCM) → Node.js → Mac Doubao (TCP 5004) → Jev model → Chrome (port 9229).</div>
+    </div>
+
+    <!-- Voice Teaching & Skill Synthesis Card -->
+    <div class="card" id="teachCard" style="border-color: rgba(245,158,11,.35)">
+      <h2>
+        <span class="dot" id="teachdot"></span>
+        Voice Teaching & Skill Synthesis
+        <span class="r small" id="teachstepcount">0 steps</span>
+      </h2>
+      <div class="row" style="margin-bottom:8px">
+        <button class="primary" id="teachBtn">Start Teaching / 开启教学</button>
+        <button id="genSkillBtn" style="display:none;background:var(--green);color:#111;border-color:var(--green)">Generate Skill / 合成Skill</button>
+        <button id="clearTeachBtn" class="small" style="display:none">Clear</button>
+      </div>
+      <div id="teachStatusText" class="small" style="color:var(--muted);margin-bottom:6px">
+        Teach the agent to buy Apple Gift Card via voice. Spoken words and CDP actions will be paired & synthesized into an Antigravity Skill.
+      </div>
+      <div id="teachStepList" style="max-height:160px;overflow-y:auto;display:flex;flex-direction:column;gap:6px;font-size:12px"></div>
+      <div id="skillResultBanner" style="display:none;margin-top:8px;padding:8px;background:rgba(34,197,94,.15);border:1px solid var(--green);border-radius:6px;font-size:12px;color:var(--green)"></div>
     </div>
 
     <div class="card grow">
@@ -212,6 +236,9 @@
         case "pending": $("pending").textContent = payload ? `⚠ pending: ${payload.summary} — say "confirm" or "cancel"` : ""; break;
         case "tabs": $("tabs").textContent = `${payload.length} tab${payload.length === 1 ? "" : "s"}`; break;
         case "doubao": renderDoubao(payload); break;
+        case "teaching_status": renderTeachingStatus(payload); break;
+        case "teaching_step": renderTeachingStep(payload); break;
+        case "skill_generated": renderSkillGenerated(payload); break;
       }
     };
   }
@@ -221,6 +248,7 @@
   function renderAll() {
     $("model").textContent = ui.model;
     renderStats(); renderSnapshot();
+    if (ui.teaching) renderTeachingStatus(ui.teaching);
     $("log").innerHTML = "";
     (ui.log || []).forEach(appendLog);
     if (ui.lastDecision) renderDecision(ui.lastDecision);
@@ -516,6 +544,118 @@
 
   $("undo").onclick = () => send({ type: "undo" });
   $("resnap").onclick = () => send({ type: "snapshot" });
+
+  // ------------------------------------------------------------ teaching & skill synthesis
+  let isTeaching = false;
+  let recordedSteps = [];
+
+  function renderTeachingStatus(p) {
+    if (!p) return;
+    isTeaching = Boolean(p.isRecording);
+    const session = p.session || p.currentSession;
+    if (isTeaching) {
+      $("teachpill").textContent = "recording";
+      $("teachpill").style.color = "var(--accent)";
+      $("teachdot").className = "dot recording";
+      $("teachBtn").textContent = "Stop Teaching / 结束教学";
+      $("teachBtn").classList.remove("primary");
+      $("teachBtn").classList.add("danger");
+      $("teachStatusText").textContent = `Teaching mode active: session "${session?.name || "buy-apple-gift-card"}". Speak your instructions!`;
+      $("teachStatusText").style.color = "var(--accent)";
+      $("genSkillBtn").style.display = "none";
+    } else {
+      $("teachpill").textContent = "idle";
+      $("teachpill").style.color = "var(--muted)";
+      $("teachdot").className = "dot";
+      $("teachBtn").textContent = "Start Teaching / 开启教学";
+      $("teachBtn").classList.add("primary");
+      $("teachBtn").classList.remove("danger");
+      $("teachStatusText").textContent = "Teach the agent to buy Apple Gift Card via voice. Spoken words and CDP actions will be paired & synthesized into an Antigravity Skill.";
+      $("teachStatusText").style.color = "var(--muted)";
+      if (session && session.steps && session.steps.length > 0) {
+        $("genSkillBtn").style.display = "inline-block";
+        $("clearTeachBtn").style.display = "inline-block";
+      }
+    }
+    if (session?.steps) {
+      recordedSteps = session.steps;
+      renderAllTeachingSteps(session.steps);
+    }
+  }
+
+  function renderTeachingStep({ step, totalSteps }) {
+    if (!step) return;
+    recordedSteps.push(step);
+    $("teachstepcount").textContent = `${totalSteps} step${totalSteps === 1 ? "" : "s"}`;
+    $("genSkillBtn").style.display = "inline-block";
+    $("clearTeachBtn").style.display = "inline-block";
+    appendTeachingStepCard(step);
+  }
+
+  function renderAllTeachingSteps(steps) {
+    $("teachstepcount").textContent = `${steps.length} step${steps.length === 1 ? "" : "s"}`;
+    const list = $("teachStepList");
+    list.innerHTML = "";
+    steps.forEach(appendTeachingStepCard);
+  }
+
+  function appendTeachingStepCard(s) {
+    const list = $("teachStepList");
+    const div = document.createElement("div");
+    div.className = "step-card";
+    const actText = s.action.type + (s.action.text ? ` ("${s.action.text}")` : s.action.url ? ` (${s.action.url})` : "");
+    const selector = s.targetElement?.semanticSelector || s.targetElement?.role || s.action.targetId || "";
+    div.innerHTML = `
+      <div class="voice">#${s.stepIndex} 🗣️ "${esc(s.voicePrompt)}"</div>
+      <div class="act">⚡ ${esc(actText)} <span style="color:var(--muted)">${esc(selector)}</span></div>
+      <div class="meta">🌐 ${esc(s.pageAfter?.url || s.pageBefore?.url || "-")} · ${s.result.ok ? "✓" : "✗"}</div>
+    `;
+    list.appendChild(div);
+    list.scrollTop = list.scrollHeight;
+  }
+
+  function renderSkillGenerated(result) {
+    const banner = $("skillResultBanner");
+    banner.style.display = "block";
+    banner.innerHTML = `
+      <div style="font-weight:700">✓ Skill Generated Successfully!</div>
+      <div style="margin-top:2px">Skill: <b>${esc(result.skillName)}</b> (${result.stepCount} steps)</div>
+      <div style="font-size:11px;color:var(--text);margin-top:4px;word-break:break-all">
+        Path: <span class="mono">${esc(result.files.skillMd)}</span>
+      </div>
+      <div style="font-size:11px;color:var(--muted);margin-top:4px">
+        Replay script: <span class="mono">${esc(result.files.script)}</span>
+      </div>
+    `;
+    appendLog({ level: "act", t: Date.now(), msg: `✓ Synthesized Antigravity Skill: ${result.skillName}` });
+  }
+
+  $("teachBtn").onclick = () => {
+    if (isTeaching) {
+      send({ type: "teaching_stop" });
+    } else {
+      send({ type: "teaching_start", name: "buy-apple-gift-card" });
+    }
+  };
+
+  $("genSkillBtn").onclick = () => {
+    $("genSkillBtn").textContent = "Synthesizing…";
+    $("genSkillBtn").disabled = true;
+    send({ type: "teaching_generate", name: "buy-apple-gift-card" });
+    setTimeout(() => {
+      $("genSkillBtn").textContent = "Generate Skill / 合成Skill";
+      $("genSkillBtn").disabled = false;
+    }, 1500);
+  };
+
+  $("clearTeachBtn").onclick = () => {
+    recordedSteps = [];
+    $("teachStepList").innerHTML = "";
+    $("teachstepcount").textContent = "0 steps";
+    $("skillResultBanner").style.display = "none";
+    $("genSkillBtn").style.display = "none";
+    $("clearTeachBtn").style.display = "none";
+  };
 
   if (window.isSecureContext === false && location.hostname !== "localhost" && location.hostname !== "127.0.0.1") {
     $("streamState").textContent = "⚠ 非安全上下文: 麦克风受限 (需配置 flags 或 HTTPS)";

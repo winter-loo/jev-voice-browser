@@ -17,6 +17,7 @@ import { Controller } from "./controller.js";
 import { DoubaoBridgeClient } from "./doubao.js";
 import { hasApiKey } from "./jev.js";
 import { MODEL, QUESTIONS, T } from "./constants.js";
+import { synthesizeSkill } from "./skill-generator.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
@@ -69,9 +70,70 @@ export async function startServer(opts = {}) {
   });
 
   const app = express();
+  app.use(express.json());
   app.use(express.static(path.join(__dirname, "public")));
   app.get("/api/state", (_req, res) => res.json(controller.uiState()));
   app.get("/api/questions", (_req, res) => res.json({ model: MODEL, thresholds: T, questions: QUESTIONS }));
+
+  // Teaching & Skill Synthesis REST API
+  app.post("/api/teaching/start", (req, res) => {
+    const session = controller.recorder.startSession({
+      name: req.body?.name || "buy-apple-gift-card",
+      title: req.body?.title || "Purchase Apple Gift Card via Voice Demonstration",
+    });
+    broadcast("teaching_status", { isRecording: true, session });
+    res.json({ ok: true, session });
+  });
+
+  app.post("/api/teaching/stop", (_req, res) => {
+    const session = controller.recorder.stopSession();
+    broadcast("teaching_status", { isRecording: false, session });
+    res.json({ ok: true, session });
+  });
+
+  app.get("/api/teaching/session", (_req, res) => {
+    res.json({
+      isRecording: controller.recorder.isRecording,
+      currentSession: controller.recorder.getCurrentSession(),
+      sessions: controller.recorder.getSessions(),
+    });
+  });
+
+  app.post("/api/teaching/generate-skill", async (req, res) => {
+    try {
+      const session =
+        req.body?.session ||
+        controller.recorder.getCurrentSession() ||
+        controller.recorder.getSessions().slice(-1)[0];
+      if (!session) {
+        return res.status(400).json({ ok: false, error: "No recorded teaching session available." });
+      }
+      const skillName = req.body?.name || session.name || "buy-apple-gift-card";
+      const result = await synthesizeSkill({ session, skillName });
+      broadcast("log", {
+        t: Date.now(),
+        level: "act",
+        msg: `Skill generated: ${result.skillName} (${result.stepCount} steps)`,
+      });
+      broadcast("skill_generated", result);
+      res.json({ ok: true, result });
+    } catch (err) {
+      res.status(500).json({ ok: false, error: err.message });
+    }
+  });
+
+  app.get("/api/skills", (_req, res) => {
+    const skillsDir = path.resolve(process.cwd(), ".agents", "skills");
+    if (!fs.existsSync(skillsDir)) return res.json({ skills: [] });
+    const names = fs.readdirSync(skillsDir).filter((f) => {
+      try {
+        return fs.statSync(path.join(skillsDir, f)).isDirectory();
+      } catch {
+        return false;
+      }
+    });
+    res.json({ skills: names });
+  });
 
   let server;
   if (opts.https) {
@@ -109,6 +171,8 @@ export async function startServer(opts = {}) {
   controller.on("candidates", (p) => broadcast("candidates", p));
   controller.on("pending", (p) => broadcast("pending", p));
   controller.on("tabs", (p) => broadcast("tabs", p));
+  controller.on("teaching_status", (p) => broadcast("teaching_status", p));
+  controller.on("teaching_step", (p) => broadcast("teaching_step", p));
   controller.on("action_consumed", () => {
     doubao.clear();
   });
@@ -185,6 +249,36 @@ export async function startServer(opts = {}) {
         case "state":
           ws.send(JSON.stringify({ type: "hello", payload: controller.uiState() }));
           break;
+        case "teaching_start": {
+          const session = controller.recorder.startSession({ name: msg.name || "buy-apple-gift-card" });
+          broadcast("teaching_status", { isRecording: true, session });
+          break;
+        }
+        case "teaching_stop": {
+          const session = controller.recorder.stopSession();
+          broadcast("teaching_status", { isRecording: false, session });
+          break;
+        }
+        case "teaching_generate": {
+          const session =
+            controller.recorder.getCurrentSession() ||
+            controller.recorder.getSessions().slice(-1)[0];
+          if (session && session.steps && session.steps.length > 0) {
+            synthesizeSkill({ session, skillName: msg.name || session.name || "buy-apple-gift-card" })
+              .then((result) => {
+                broadcast("log", {
+                  t: Date.now(),
+                  level: "act",
+                  msg: `Skill generated: ${result.skillName} (${result.stepCount} steps)`,
+                });
+                broadcast("skill_generated", result);
+              })
+              .catch((err) => {
+                broadcast("log", { t: Date.now(), level: "error", msg: `Skill generation failed: ${err.message}` });
+              });
+          }
+          break;
+        }
         default:
           break;
       }

@@ -9,6 +9,7 @@ import { evaluatePolicy, describe } from "./policy.js";
 import { execute } from "./executor.js";
 import { parseCandidatePick, cleanTranscript, cleanForMatch, stripExecutedPrefix, extractNewText } from "./spans.js";
 import { approxTokens } from "./snapshot.js";
+import { TeachingRecorder } from "./teaching.js";
 
 const avg = (xs) => (xs.length ? Math.round(xs.reduce((a, b) => a + b, 0) / xs.length) : null);
 
@@ -38,6 +39,9 @@ export class Controller extends EventEmitter {
     this.log = [];
     this.stats = { calls: 0, inputTokens: 0, costUsd: 0, latencies: [], actions: 0, model: MODEL, commandToActionMs: [], decisionMs: [] };
     this.history = [];
+    this.recorder = new TeachingRecorder();
+    this.recorder.on("status", (s) => this.emit("teaching_status", s));
+    this.recorder.on("step", (st) => this.emit("teaching_step", st));
     browser.onChange(() => this.emit("tabs", browser.tabInfo()));
   }
 
@@ -144,6 +148,22 @@ export class Controller extends EventEmitter {
         this._runAction(action, { via: "candidate-pick" });
         return;
       }
+    }
+
+    // Teaching mode voice triggers
+    if (/开始教学|start teaching/i.test(clean)) {
+      this._consume(this.utterance, clean);
+      this.recorder.startSession({ name: "buy-apple-gift-card" });
+      this._log("info", "Teaching mode started: recording voice and actions");
+      this.browser.overlay("toast", "Teaching Started / 开启教学", 3000).catch(() => {});
+      return;
+    }
+    if (/结束教学|stop teaching|完成教学/i.test(clean)) {
+      this._consume(this.utterance, clean);
+      const session = this.recorder.stopSession();
+      this._log("info", `Teaching mode stopped: ${session?.steps?.length || 0} steps recorded`);
+      this.browser.overlay("toast", "Teaching Stopped / 教学已结束", 3000).catch(() => {});
+      return;
     }
 
     clearTimeout(this.debounceTimer);
@@ -309,6 +329,10 @@ export class Controller extends EventEmitter {
     this.busy = true;
     const t0 = Date.now();
     const utt = meta.utterance || this.utterance;
+    const pageBefore = this.snapshot ? { url: this.snapshot.url, title: this.snapshot.title } : null;
+    const targetElement = action.targetId && this.snapshot?.elements
+      ? this.snapshot.elements.find((e) => e.id === action.targetId) || null
+      : null;
     try {
       const res = await this._execute(action, this.browser);
       const took = Date.now() - t0;
@@ -331,6 +355,18 @@ export class Controller extends EventEmitter {
       };
       this._log(res.ok ? "act" : "warn", `${res.ok ? "✓" : "✗"} ${describe(action)} — decided ${decisionMs ?? "?"}ms after last word, executed in ${took}ms ${res.detail || ""}`);
       this.emit("action", entry);
+
+      if (this.recorder?.isRecording) {
+        this.recorder.recordStep({
+          voicePrompt: utt ? utt.text : (action.label || action.type),
+          rawTranscript: this.lastRawText || (utt ? utt.text : ""),
+          action,
+          targetElement,
+          pageBefore,
+          pageAfter: { url: res.detail || pageBefore?.url, title: this.snapshot?.title || "" },
+          result: { ok: res.ok, detail: res.detail },
+        });
+      }
     } catch (err) {
       this._log("error", `action failed: ${describe(action)} — ${err.message || err}`);
       this.emit("action", { action, ok: false, detail: String(err.message || err) });
@@ -375,6 +411,11 @@ export class Controller extends EventEmitter {
       pending: this.pending ? { summary: describe(this.pending) } : null,
       candidates: this.candidates?.list ?? null,
       log: this.log.slice(-60),
+      teaching: {
+        isRecording: Boolean(this.recorder?.isRecording),
+        currentSession: this.recorder?.getCurrentSession() || null,
+        sessionCount: this.recorder?.getSessions().length || 0,
+      },
     };
   }
 
